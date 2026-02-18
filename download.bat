@@ -1,0 +1,1 @@
+python download.py --dataset 12 --max-workers 10 --request-delay 1
