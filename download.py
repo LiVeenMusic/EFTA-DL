@@ -17,7 +17,7 @@ import argparse
 
 # ================= CONFIG =================
 
-DEFAULT_DATASET = 10  # Default dataset number
+DEFAULT_DATASET = 12  # Default dataset number
 START_URL = f"https://www.justice.gov/epstein/doj-disclosures/data-set-{DEFAULT_DATASET}-files?page=0"
 DOWNLOAD_DIR = "downloads"
 STATE_FILE = "crawl_state.json"
