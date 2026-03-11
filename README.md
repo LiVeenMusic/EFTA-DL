@@ -14,6 +14,8 @@ This tool automates bulk downloading of DOJ disclosure files with:
 - **Detects altered files** — Manages filename collisions intelligently, effectively handling files that have the same filename and same contents (duplicates), as well as files that have the same filename but different contents (redactions/modifications)
 - **Creates comparison reports for conflicts** — On filename conflicts with different contents, the script can generate a readable compare PDF and a visual side-by-side compare PDF for PDFs
 - **Detects missing files** — Uses the database to keep track of which filenames are supposed to be in specific page=x URLs, and when running with --organize, will move any missing files into an "unmatched" folder. (MIGHT HAVE ISSUES. ALWAYS BACKUP!)
+- **Safe cancellation** — Doing CTRL + C while the script is running will not fully terminate immediately. Instead, it will finish the current page, and then safely exit so that you don't end up with corrupted files.
+- **Default dataset is 12** — Yes, this is a feature. Dataset 12 is tiny, so if you make a mistake, it won't cost you ages.
 
 ## Prerequisites
 
