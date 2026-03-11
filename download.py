@@ -4,6 +4,7 @@ import csv
 import json
 import time
 import hashlib
+import difflib
 import sqlite3
 import threading
 import signal
@@ -16,14 +17,14 @@ import argparse
 
 # ================= CONFIG =================
 
-DEFAULT_DATASET = 12  # Default dataset number
+DEFAULT_DATASET = 10  # Default dataset number
 START_URL = f"https://www.justice.gov/epstein/doj-disclosures/data-set-{DEFAULT_DATASET}-files?page=0"
 DOWNLOAD_DIR = "downloads"
 STATE_FILE = "crawl_state.json"
 CSV_LOG = "downloads.csv"
 
-MAX_WORKERS = 8            # parallel downloads
-REQUEST_DELAY = 0.6          # seconds between page fetches
+MAX_WORKERS = 10            # parallel downloads
+REQUEST_DELAY = 0.4          # seconds between page fetches
 DRY_RUN = False            # set True to disable downloads
 MAX_PAGES_PER_PART = 1000    # max page folders per part folder
 
@@ -700,6 +701,507 @@ def file_hash(path, block_size=65536):
     return h.hexdigest()
 
 
+def _pdf_escape(text):
+    """Escape text for use inside a PDF literal string."""
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def write_text_pdf(lines, out_path):
+    """Write a text PDF using only the Python standard library.
+
+    Supports either plain strings or styled entries:
+      {"text": "...", "color": (r, g, b)}
+      {"page_break": True}
+    where RGB values are floats in [0.0, 1.0].
+    """
+    page_width = 612
+    page_height = 792
+    left_margin = 40
+    top_y = 760
+    line_height = 12
+    max_chars = 110
+    lines_per_page = 58
+
+    if not lines:
+        lines = ["(no content)"]
+
+    normalized = []
+    for item in lines:
+        if isinstance(item, dict):
+            if item.get("page_break"):
+                normalized.append({"page_break": True})
+                continue
+            text = str(item.get("text", ""))
+            color = item.get("color", (0, 0, 0))
+        else:
+            text = str(item)
+            color = (0, 0, 0)
+
+        if len(text) <= max_chars:
+            normalized.append({"text": text, "color": color})
+            continue
+        for i in range(0, len(text), max_chars):
+            normalized.append({"text": text[i:i + max_chars], "color": color})
+
+    pages = []
+    current_page = []
+    for entry in normalized:
+        if entry.get("page_break"):
+            if current_page:
+                pages.append(current_page)
+                current_page = []
+            continue
+        current_page.append(entry)
+        if len(current_page) >= lines_per_page:
+            pages.append(current_page)
+            current_page = []
+    if current_page:
+        pages.append(current_page)
+
+    if not pages:
+        pages = [[{"text": "(no content)", "color": (0, 0, 0)}]]
+
+    objects = {}
+    page_obj_nums = []
+    content_obj_nums = []
+
+    # 1: catalog, 2: pages root, 3: font
+    objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    objects[3] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"
+
+    next_obj = 4
+    for page_lines in pages:
+        page_obj = next_obj
+        content_obj = next_obj + 1
+        next_obj += 2
+
+        page_obj_nums.append(page_obj)
+        content_obj_nums.append(content_obj)
+
+        stream_lines = [
+            "BT",
+            "/F1 9 Tf",
+            f"{left_margin} {top_y} Td",
+            f"{line_height} TL"
+        ]
+
+        for idx, entry in enumerate(page_lines):
+            if idx != 0:
+                stream_lines.append("T*")
+            line = entry.get("text", "")
+            color = entry.get("color", (0, 0, 0))
+            try:
+                r, g, b = color
+            except Exception:
+                r, g, b = 0, 0, 0
+            escaped = _pdf_escape(line)
+            stream_lines.append(f"{r:.3f} {g:.3f} {b:.3f} rg")
+            stream_lines.append(f"({escaped}) Tj")
+        stream_lines.append("ET")
+
+        stream = "\n".join(stream_lines).encode("latin-1", errors="replace")
+        objects[content_obj] = (
+            f"<< /Length {len(stream)} >>\nstream\n".encode("ascii") +
+            stream +
+            b"\nendstream"
+        )
+
+        objects[page_obj] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_obj} 0 R >>"
+        ).encode("ascii")
+
+    kids = " ".join(f"{n} 0 R" for n in page_obj_nums)
+    objects[2] = f"<< /Type /Pages /Kids [ {kids} ] /Count {len(page_obj_nums)} >>".encode("ascii")
+
+    max_obj = max(objects.keys())
+    blob = bytearray()
+    blob.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+
+    offsets = [0] * (max_obj + 1)
+    for obj_num in range(1, max_obj + 1):
+        content = objects[obj_num]
+        offsets[obj_num] = len(blob)
+        blob.extend(f"{obj_num} 0 obj\n".encode("ascii"))
+        blob.extend(content)
+        blob.extend(b"\nendobj\n")
+
+    xref_offset = len(blob)
+    blob.extend(f"xref\n0 {max_obj + 1}\n".encode("ascii"))
+    blob.extend(b"0000000000 65535 f \n")
+    for obj_num in range(1, max_obj + 1):
+        blob.extend(f"{offsets[obj_num]:010d} 00000 n \n".encode("ascii"))
+
+    blob.extend(
+        (
+            f"trailer\n<< /Size {max_obj + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+
+    with open(out_path, "wb") as f:
+        f.write(blob)
+
+
+def _looks_binary(buf):
+    if not buf:
+        return False
+    if b"\x00" in buf:
+        return True
+    printable = 0
+    for b in buf[:4096]:
+        if b in (9, 10, 13) or 32 <= b <= 126:
+            printable += 1
+    sample_len = min(len(buf), 4096)
+    return sample_len > 0 and (printable / sample_len) < 0.70
+
+
+def _hexdump_lines(path, limit_bytes=262144):
+    lines = []
+    with open(path, "rb") as f:
+        data = f.read(limit_bytes)
+    for offset in range(0, len(data), 16):
+        chunk = data[offset:offset + 16]
+        hex_chunk = " ".join(f"{b:02x}" for b in chunk)
+        ascii_chunk = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+        lines.append(f"{offset:08x}: {hex_chunk:<47} |{ascii_chunk}|")
+    if len(data) >= limit_bytes:
+        lines.append(f"... hexdump truncated at {limit_bytes} bytes ...")
+    return lines
+
+
+def _extract_pdf_text_lines(path, max_pages=250):
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return None
+
+
+def _extract_pdf_page_lines(path, max_pages=250):
+    """Return PDF text as list-of-pages, where each page is a list of lines."""
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return None
+
+    try:
+        reader = PdfReader(path)
+        pages = []
+        for page in reader.pages[:max_pages]:
+            text = page.extract_text() or ""
+            if text.strip():
+                pages.append(text.splitlines())
+            else:
+                pages.append(["<no extractable text>"])
+        return pages
+    except Exception:
+        return None
+
+    try:
+        reader = PdfReader(path)
+        lines = []
+        for idx, page in enumerate(reader.pages[:max_pages]):
+            text = page.extract_text() or ""
+            lines.append(f"[PAGE {idx + 1}]")
+            if text.strip():
+                lines.extend(text.splitlines())
+            else:
+                lines.append("<no extractable text>")
+        if len(reader.pages) > max_pages:
+            lines.append(f"... text extraction truncated at {max_pages} pages ...")
+        return lines
+    except Exception:
+        return None
+
+
+def extract_comparison_lines(path):
+    """Extract line-based content for diffing, with binary-safe fallback."""
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".pdf":
+        pdf_lines = _extract_pdf_text_lines(path)
+        if pdf_lines:
+            return pdf_lines
+
+    with open(path, "rb") as f:
+        raw = f.read(524288)
+
+    if not _looks_binary(raw):
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        if len(raw) >= 524288:
+            lines.append("... text extraction truncated at 524288 bytes ...")
+        return lines
+
+    return _hexdump_lines(path)
+
+
+def get_compare_pdf_path(conflict_path, filename, file_hash_value=None):
+    """Return a compare-report path alongside the conflict file."""
+    conflict_dir = os.path.dirname(conflict_path)
+    stem, _ = os.path.splitext(filename)
+
+    base_path = os.path.join(conflict_dir, f"{stem}_compare.pdf")
+    if not os.path.exists(base_path):
+        return base_path
+
+    # If the canonical compare path already exists, create a unique sibling.
+    suffix = None
+    conflict_name = os.path.basename(conflict_path)
+    if "__" in conflict_name:
+        suffix = conflict_name.split("__", 1)[1]
+    if not suffix and file_hash_value:
+        suffix = file_hash_value[:8]
+    if not suffix:
+        suffix = str(int(time.time()))
+
+    return os.path.join(conflict_dir, f"{stem}_compare__{suffix}.pdf")
+
+
+def generate_conflict_compare_pdf(existing_path, conflict_path, filename, file_hash_value=None):
+    """Create a comparison PDF report for two conflicting files.
+
+    The generated report is line-based and marks additions/deletions from a
+    unified diff so conflicts can be triaged quickly.
+    """
+    if not existing_path or not os.path.exists(existing_path):
+        print(f"⚠️ Could not create compare PDF for {filename}: original file not found")
+        return None
+    if not conflict_path or not os.path.exists(conflict_path):
+        print(f"⚠️ Could not create compare PDF for {filename}: conflict file not found")
+        return None
+
+    compare_pdf_path = get_compare_pdf_path(conflict_path, filename, file_hash_value=file_hash_value)
+
+    try:
+        ext = os.path.splitext(filename)[1].lower()
+
+        # For PDF-to-PDF conflicts, build a page-aware diff report where each
+        # changed source page starts on a new report page for fast navigation.
+        if ext == ".pdf":
+            old_pages = _extract_pdf_page_lines(existing_path)
+            new_pages = _extract_pdf_page_lines(conflict_path)
+            if old_pages is not None and new_pages is not None:
+                report_lines = [
+                    {"text": f"Conflict comparison for: {filename}", "color": (0.0, 0.0, 0.0)},
+                    {"text": f"Original: {existing_path}", "color": (0.15, 0.15, 0.15)},
+                    {"text": f"Conflict: {conflict_path}", "color": (0.15, 0.15, 0.15)},
+                    {"text": "Legend: RED removed, GREEN added, BLUE hunk header", "color": (0.2, 0.2, 0.2)},
+                    {"text": "", "color": (0, 0, 0)},
+                ]
+
+                changed_pages = 0
+                max_pages = max(len(old_pages), len(new_pages))
+                for idx in range(max_pages):
+                    old_lines = old_pages[idx] if idx < len(old_pages) else []
+                    new_lines = new_pages[idx] if idx < len(new_pages) else []
+
+                    diff = list(
+                        difflib.unified_diff(
+                            old_lines,
+                            new_lines,
+                            fromfile=f"original_page_{idx + 1}",
+                            tofile=f"conflict_page_{idx + 1}",
+                            lineterm="",
+                            n=2,
+                        )
+                    )
+
+                    has_real_changes = any(
+                        (ln.startswith("+") and not ln.startswith("+++")) or
+                        (ln.startswith("-") and not ln.startswith("---"))
+                        for ln in diff
+                    )
+                    if not has_real_changes:
+                        continue
+
+                    changed_pages += 1
+                    if changed_pages > 1:
+                        report_lines.append({"page_break": True})
+
+                    report_lines.append({"text": f"Page {idx + 1} changes", "color": (0.0, 0.0, 0.0)})
+                    report_lines.append({"text": "", "color": (0, 0, 0)})
+
+                    max_diff_lines = 2200
+                    for line in diff[:max_diff_lines]:
+                        if line.startswith("@@"):
+                            report_lines.append({"text": f"[HUNK] {line}", "color": (0.1, 0.2, 0.8)})
+                        elif line.startswith("+") and not line.startswith("+++"):
+                            report_lines.append({"text": f"[ADD] {line[1:]}", "color": (0.0, 0.55, 0.0)})
+                        elif line.startswith("-") and not line.startswith("---"):
+                            report_lines.append({"text": f"[DEL] {line[1:]}", "color": (0.78, 0.0, 0.0)})
+                        elif line.startswith("---") or line.startswith("+++"):
+                            continue
+                        else:
+                            report_lines.append({"text": line, "color": (0.25, 0.25, 0.25)})
+                    if len(diff) > max_diff_lines:
+                        report_lines.append({"text": f"... diff truncated at {max_diff_lines} lines ...", "color": (0.35, 0.35, 0.35)})
+
+                if changed_pages == 0:
+                    report_lines.append({"text": "No page-level text differences found.", "color": (0.1, 0.45, 0.1)})
+
+                os.makedirs(os.path.dirname(compare_pdf_path), exist_ok=True)
+                write_text_pdf(report_lines, compare_pdf_path)
+                return compare_pdf_path
+
+        old_lines = extract_comparison_lines(existing_path)
+        new_lines = extract_comparison_lines(conflict_path)
+        diff = list(
+            difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile=os.path.basename(existing_path),
+                tofile=os.path.basename(conflict_path),
+                lineterm="",
+                n=2,
+            )
+        )
+
+        report_lines = [
+            {"text": f"Conflict comparison for: {filename}", "color": (0.0, 0.0, 0.0)},
+            {"text": f"Original: {existing_path}", "color": (0.15, 0.15, 0.15)},
+            {"text": f"Conflict: {conflict_path}", "color": (0.15, 0.15, 0.15)},
+            {"text": "Legend: RED removed, GREEN added, BLUE hunk header", "color": (0.2, 0.2, 0.2)},
+            {"text": "", "color": (0, 0, 0)},
+        ]
+
+        if not diff:
+            report_lines.append({"text": "No diff lines produced by comparator.", "color": (0.1, 0.45, 0.1)})
+        else:
+            max_diff_lines = 1800
+            trimmed = diff[:max_diff_lines]
+            for line in trimmed:
+                if line.startswith("@@"):
+                    report_lines.append({"text": f"[HUNK] {line}", "color": (0.1, 0.2, 0.8)})
+                elif line.startswith("+") and not line.startswith("+++"):
+                    report_lines.append({"text": f"[ADD] {line[1:]}", "color": (0.0, 0.55, 0.0)})
+                elif line.startswith("-") and not line.startswith("---"):
+                    report_lines.append({"text": f"[DEL] {line[1:]}", "color": (0.78, 0.0, 0.0)})
+                else:
+                    report_lines.append({"text": line, "color": (0.25, 0.25, 0.25)})
+            if len(diff) > max_diff_lines:
+                report_lines.append({"text": f"... diff truncated at {max_diff_lines} lines ...", "color": (0.35, 0.35, 0.35)})
+
+        os.makedirs(os.path.dirname(compare_pdf_path), exist_ok=True)
+        write_text_pdf(report_lines, compare_pdf_path)
+        return compare_pdf_path
+    except Exception as e:
+        print(f"⚠️ Failed to create compare PDF for {filename}: {e}")
+        return None
+
+
+def generate_visual_pdf_comparison(existing_path, conflict_path, filename, file_hash_value=None):
+    """Create a visual side-by-side PDF comparison using PyMuPDF.
+
+    This generates a PDF where each page shows the original and conflict versions
+    side-by-side, making visual differences easy to spot. Only works for PDF files.
+    """
+    # Only works for PDF files
+    ext = os.path.splitext(filename)[1].lower()
+    if ext != ".pdf":
+        return None
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        # Silently skip if PyMuPDF not installed (text diff is still useful)
+        return None
+
+    if not existing_path or not os.path.exists(existing_path):
+        return None
+    if not conflict_path or not os.path.exists(conflict_path):
+        return None
+
+    try:
+        # Open both PDFs
+        doc_old = fitz.open(existing_path)
+        doc_new = fitz.open(conflict_path)
+
+        # Create output path
+        conflict_dir = os.path.dirname(conflict_path)
+        stem, _ = os.path.splitext(filename)
+
+        base_path = os.path.join(conflict_dir, f"{stem}_visual_compare.pdf")
+        if os.path.exists(base_path):
+            suffix = file_hash_value[:8] if file_hash_value else str(int(time.time()))
+            base_path = os.path.join(conflict_dir, f"{stem}_visual_compare__{suffix}.pdf")
+
+        # Create new PDF for side-by-side comparison
+        output = fitz.open()
+
+        max_pages = max(len(doc_old), len(doc_new))
+
+        for page_num in range(max_pages):
+            # Create a new page (landscape to fit both documents side by side)
+            # Use A4 landscape dimensions: 842 x 595 points
+            new_page = output.new_page(width=842, height=595)
+
+            # Left side: original document
+            if page_num < len(doc_old):
+                old_page = doc_old[page_num]
+                # Scale to fit left half with margin
+                dst_rect = fitz.Rect(10, 30, 411, 585)
+                new_page.show_pdf_page(dst_rect, doc_old, page_num)
+                # Add label at top
+                new_page.insert_text((10, 20), f"ORIGINAL (page {page_num + 1})",
+                                    fontsize=9, color=(0, 0, 0.8))
+            else:
+                # If original has fewer pages, show placeholder
+                new_page.insert_text((100, 300), f"(Original has only {len(doc_old)} pages)",
+                                    fontsize=10, color=(0.5, 0.5, 0.5))
+                new_page.insert_text((10, 20), "ORIGINAL",
+                                    fontsize=9, color=(0, 0, 0.8))
+
+            # Right side: conflict document
+            if page_num < len(doc_new):
+                new_page_obj = doc_new[page_num]
+                # Scale to fit right half with margin
+                dst_rect = fitz.Rect(431, 30, 832, 585)
+                new_page.show_pdf_page(dst_rect, doc_new, page_num)
+                # Add label at top
+                new_page.insert_text((431, 20), f"CONFLICT (page {page_num + 1})",
+                                    fontsize=9, color=(0.8, 0, 0))
+            else:
+                # If conflict has fewer pages, show placeholder
+                new_page.insert_text((500, 300), f"(Conflict has only {len(doc_new)} pages)",
+                                    fontsize=10, color=(0.5, 0.5, 0.5))
+                new_page.insert_text((431, 20), "CONFLICT",
+                                    fontsize=9, color=(0.8, 0, 0))
+
+            # Draw vertical dividing line
+            new_page.draw_line((421, 0), (421, 595), color=(0.3, 0.3, 0.3), width=2)
+
+        # Add title page at the beginning
+        title_page = output.new_page(0, width=842, height=595)
+        title_page.insert_text((50, 100), "PDF CONFLICT — VISUAL COMPARISON",
+                              fontsize=20, color=(0, 0, 0))
+        title_page.insert_text((50, 150), f"Filename: {filename}",
+                              fontsize=12, color=(0, 0, 0))
+        title_page.insert_text((50, 180), f"Original file: {os.path.basename(existing_path)}",
+                              fontsize=10, color=(0, 0, 0.8))
+        title_page.insert_text((50, 200), f"Conflict file: {os.path.basename(conflict_path)}",
+                              fontsize=10, color=(0.8, 0, 0))
+        title_page.insert_text((50, 230), f"Page counts: Original={len(doc_old)} | Conflict={len(doc_new)}",
+                              fontsize=10, color=(0, 0, 0))
+        title_page.insert_text((50, 280), "Each page shows the two versions side-by-side for comparison.",
+                              fontsize=9, color=(0.3, 0.3, 0.3))
+        title_page.insert_text((50, 300), "Left (blue label) = Original | Right (red label) = Conflict",
+                              fontsize=9, color=(0.3, 0.3, 0.3))
+
+        # Save the output
+        os.makedirs(os.path.dirname(base_path), exist_ok=True)
+        output.save(base_path)
+        output.close()
+        doc_old.close()
+        doc_new.close()
+
+        return base_path
+
+    except Exception as e:
+        print(f"⚠️ Failed to create visual PDF comparison for {filename}: {e}")
+        return None
+
+
 def find_existing_file(filename):
     """Search for an existing file with the given filename using the index DB
     first (fast), and fall back to scanning filesystem (updates index lazily).
@@ -895,11 +1397,14 @@ def download_file(url, page_num=None):
                         # Save conflict to conflicts/page_X/ (no part folders for conflicts)
                         conflict_dest = get_download_path_for_page(page_num, filename, is_conflict=True)
                         conflict_dir = os.path.dirname(conflict_dest)
+                        compare_dest = get_compare_pdf_path(conflict_dest, filename, file_hash_value=h)
                         
                         if args.dry_run:
                             if os.path.exists(conflict_dest):
                                 conflict_dest = conflict_dest.replace(filename, f"{filename}__{h[:8]}")
+                            compare_dest = get_compare_pdf_path(conflict_dest, filename, file_hash_value=h)
                             print(f"🧪 DRY-RUN: would save conflicting content for {filename} -> {conflict_dest}")
+                            print(f"🧪 DRY-RUN: would generate compare PDF -> {compare_dest}")
                             log_csv([filename, url, "DRY_RUN_CONFLICT", conflict_dest])
                             seen_hashes.add(h)
                             return True
@@ -915,6 +1420,17 @@ def download_file(url, page_num=None):
                             db_upsert_file(filename, conflict_dest, os.path.getsize(conflict_dest), h, page_num=page_num, status="conflict")
                         except Exception:
                             pass
+
+                        # Generate text-based diff report
+                        compare_pdf_path = generate_conflict_compare_pdf(existing_path, conflict_dest, filename, file_hash_value=h)
+                        if compare_pdf_path:
+                            print(f"📝 Text diff PDF: {compare_pdf_path}")
+
+                        # Generate visual side-by-side comparison for PDFs
+                        visual_pdf_path = generate_visual_pdf_comparison(existing_path, conflict_dest, filename, file_hash_value=h)
+                        if visual_pdf_path:
+                            print(f"🖼️  Visual comparison PDF: {visual_pdf_path}")
+
                         print(f"⚠️ Filename conflict for {filename}; different content saved to {conflict_dest}")
                         log_csv([filename, url, "FILENAME_CONFLICT", conflict_dest])
                         seen_hashes.add(h)
