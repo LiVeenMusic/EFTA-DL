@@ -12,6 +12,7 @@ This tool automates bulk downloading of DOJ disclosure files with:
 - **Multiple fetch strategies** — httpx (HTTP/2), Playwright, or requests fallbacks
 - **Resume capability** — Stop and resume where you left off without data loss
 - **Detects altered files** — Manages filename collisions intelligently, effectively handling files that have the same filename and same contents (duplicates), as well as files that have the same filename but different contents (redactions/modifications)
+- **Creates comparison reports for conflicts** — On filename conflicts with different contents, the script can generate a readable compare PDF and a visual side-by-side compare PDF for PDFs
 - **Detects missing files** — Uses the database to keep track of which filenames are supposed to be in specific page=x URLs, and when running with --organize, will move any missing files into an "unmatched" folder. (MIGHT HAVE ISSUES. ALWAYS BACKUP!)
 
 ## Prerequisites
@@ -36,8 +37,13 @@ This is usually better than running scripts by double-clicking, as it means fini
 
 ```bash
 pip install -U pip
-pip install requests bs4 playwright httpx httpx[http2] 'httpx[cli]'
+pip install requests bs4 playwright httpx httpx[http2] 'httpx[cli]' pypdf PyMuPDF
 ```
+
+Notes:
+- `pypdf` is used to extract page text for page-aware compare reports.
+- `PyMuPDF` is used to build the visual side-by-side comparison PDFs.
+- If those optional packages are missing, normal downloading still works, but PDF comparison output will be reduced or skipped.
 
 ### Step 2: Install Playwright Browser
 
@@ -102,6 +108,46 @@ This crawls the website to map filenames to pages, then moves local files into t
 Highly recommmend avoiding having to do this, as I have not been able to fully verify that it is working properly. 
 
 (*NOTE: ALWAYS MAKE SURE TO RESCAN FIRST, IF THERE ISN'T ALREADY A .DB FILE*)
+
+## Conflict Handling And Compare Reports
+
+When the scraper encounters the same filename again, it handles it in three different ways:
+
+1. **Same filename + same content**
+    The file is treated as a duplicate and skipped.
+
+2. **Same filename + different content**
+    The new file is saved into the `downloads/conflicts/page_X/` folder.
+
+3. **Conflict reports for changed PDFs and files**
+    The script also generates helper comparison files next to the conflict file.
+
+Generated files typically look like this:
+
+```text
+downloads/conflicts/page_123/
+├── EFTA01234567.pdf
+├── EFTA01234567_compare.pdf
+└── EFTA01234567_visual_compare.pdf
+```
+
+What each file means:
+- `filename.pdf` — The newly downloaded conflicting file.
+- `filename_compare.pdf` — A text-based comparison report.
+- `filename_visual_compare.pdf` — A visual side-by-side comparison for PDF conflicts.
+
+The normal compare PDF now includes:
+- Color-coded diff lines
+- Red for removed lines
+- Green for added lines
+- Blue hunk headers
+- Separate report pages for each changed source PDF page
+- Page headers like `Page 17 changes` so you can jump directly to the page with changes
+
+The visual compare PDF shows:
+- Original PDF on one side
+- Conflict PDF on the other side
+- A quick visual way to inspect redactions, formatting changes, and page-level differences
 
 ## CLI Arguments Reference
 
@@ -200,12 +246,14 @@ downloads/
 │       └── file4.pdf
 └── conflicts/
     └── page_0/
-        └── duplicate_name.pdf
+        ├── duplicate_name.pdf
+        ├── duplicate_name_compare.pdf
+        └── duplicate_name_visual_compare.pdf
 ```
 
 - **part_X folders** — Organize pages into parts (1000 pages per part by default)
 - **page_Y folders** — Each page's files in its own folder
-- **conflicts/** — Files with duplicate names go here with a suffix
+- **conflicts/** — Files with duplicate names but different contents go here, along with generated comparison reports
 
 ## Common Workflows
 
@@ -325,6 +373,18 @@ Rebuild the index:
 python download.py --rescan
 ```
 
+### Compare PDFs Are Missing
+
+If conflict files are being saved but compare PDFs are not showing up, check these packages:
+
+```bash
+pip install pypdf PyMuPDF
+```
+
+Notes:
+- Missing `pypdf` can prevent page-aware PDF text extraction for the normal compare report.
+- Missing `PyMuPDF` can prevent the visual compare PDF from being created.
+
 ### Import Certificate Errors (Playwright)
 
 Ensure you ran:
@@ -358,7 +418,7 @@ Every downloaded file is tracked in `downloads.db` with:
 - File path
 - SHA-256 hash
 - Page number if applicable
-- Status (downloaded, duplicate, conflict)
+- Status (downloaded, duplicate, conflict, unmatched)
 - Timestamp
 
 Use the database to:
@@ -376,4 +436,4 @@ For issues, questions, or improvements, check the script logs (if used) and use 
 
 ---
 
-**Last Updated:** February 2026
+**Last Updated:** March 2026
