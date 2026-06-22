@@ -14,6 +14,8 @@ This tool automates bulk downloading of DOJ disclosure files with:
 - **Detects altered files** — Manages filename collisions intelligently, effectively handling files that have the same filename and same contents (duplicates), as well as files that have the same filename but different contents (redactions/modifications)
 - **Creates comparison reports for conflicts** — On filename conflicts with different contents, the script can generate a readable compare PDF and a visual side-by-side compare PDF for PDFs
 - **Detects missing files** — Uses the database to keep track of which filenames are supposed to be in specific page=x URLs, and when running with --organize, will move any missing files into an "unmatched" folder. (MIGHT HAVE ISSUES. ALWAYS BACKUP!)
+- **Safe cancellation** — Doing CTRL + C while the script is running will not fully terminate immediately. Instead, it will finish the current page, and then safely exit so that you don't end up with corrupted files.
+- **Default dataset is 12** — Yes, this is a feature. Dataset 12 is tiny, so if you make a mistake, it won't cost you ages.
 
 ## Prerequisites
 
@@ -26,7 +28,7 @@ Note: Step 1 and 2 are only needed to run 1 time.
 
 Step 3 might have to be run when switching between different datasets, though your mileage may vary. The reason for this is likely related to how the script loads things into RAM, and has been causing non-stop issues for me until I started rescanning between datasets.
 
-**Make sure that each dataset has it's own folder! i.e dataset 9 would be it's own folder containing a downloads folder and a download.py script (remember --rescan if you make a new dataset folder, to create the database). Using the same folder for multiple datasets might work, but is not something I have planned for.**
+**Make sure that each dataset has it's own folder! i.e dataset 12 would be it's own folder containing a downloads folder and a download.py script (remember --rescan if you make a new dataset folder, to create the database). Using the same folder for multiple datasets might work, but is not something I have planned for.**
 
 ### Step 0: Open a terminal
 In Windows, when you have a certain folder open, you can simply click the top address bar (so that it becomes a text field), type "cmd" (without quotes) and hit Enter, and it should open a terminal window inside that folder. 
@@ -75,13 +77,13 @@ python download.py
 Dataset numbers refer to the URL structure (`data-set-{N}-files`):
 
 ```bash
-python download.py --dataset 9
+python download.py --dataset 12
 ```
 
 ### Resume from a Specific Page
 
 ```bash
-python download.py --dataset 9 --start-page 9210
+python download.py --dataset 12 --start-page 9210
 ```
 
 The script will resume from page 9210. Use `--no-resume` or `--start-page 0` to ignore saved state and start from scratch.
@@ -89,7 +91,7 @@ The script will resume from page 9210. Use `--no-resume` or `--start-page 0` to 
 ### Bulk Download with High Concurrency
 
 ```bash
-python download.py --dataset 9 --max-workers 50 --request-delay 0.1
+python download.py --dataset 12 --max-workers 50 --request-delay 0.1
 ```
 
 - `--max-workers 50` — Download 50 files in parallel (be careful. Once the database and folders get populated with tens of thousands of files, it can get slower to respond)
@@ -157,7 +159,7 @@ Note: I have set up the default options to work well here, assuming you have com
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--dataset` | int | 10 | Dataset number (e.g., `9`, `10`, `11`) |
+| `--dataset` | int | 10 | Dataset number (e.g., `9`, `10`, `11`, `12`) |
 | `--start-url` | string | auto | Full URL override (ignores `--dataset` and `--start-page`) |
 | `--start-page` | int | 0 | Start page number (constructs URL automatically) |
 | `--end-page` | int | unlimited | Stop crawling after reaching this page |
@@ -257,10 +259,10 @@ downloads/
 
 ## Common Workflows
 
-### 1. Download Dataset 9 with High Speed
+### 1. Download Dataset 12 with High Speed
 
 ```bash
-python download.py --dataset 9 --max-workers 50 --request-delay 0.1
+python download.py --dataset 12 --max-workers 50 --request-delay 0.1
 ```
 
 ### 2. Download Dataset 11 Up to Page 11,000
