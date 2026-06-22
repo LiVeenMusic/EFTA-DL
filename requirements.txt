@@ -1,0 +1,9 @@
+browser_cookie3
+requests
+bs4
+playwright
+httpx
+httpx[http2]
+httpx[cli]
+pypdf
+PyMuPDF

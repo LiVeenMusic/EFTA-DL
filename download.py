@@ -45,6 +45,18 @@ ENABLE_CSV_LOG = False           # when False, disable downloads.csv logging
 ENABLE_STATE_FILE = False        # when False, disable crawl_state.json usage
 ENABLE_DB_STATE = True           # when True, persist crawl state in the DB
 END_PAGE_NUM = None              # when set, stop crawling after reaching this page
+# When True, skip common audio/video formats when scraping links
+SKIP_MEDIA = False
+
+# Media extensions to skip when `--skip-media` is used
+MEDIA_EXTENSIONS = {
+    # Video
+    ".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".wmv", ".m4v",
+    ".mpg", ".mpeg", ".3gp", ".ts", ".m2ts", ".mts", ".vob", ".f4v",
+    # Audio
+    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".alac",
+    ".aiff", ".opus", ".wv", ".ape"
+}
 
 # ==========================================
 
@@ -1536,10 +1548,17 @@ def scrape_links(url, referer=None, max_retries=None):
         links = []
         for a in container.find_all("a", href=True):
             href = a["href"]
-            # Download any file with an extension (anything with a dot before the last path segment)
-            # This captures all file types, not just PDF/ZIP/CSV/TXT
-            if re.search(r"\.[a-zA-Z0-9]+$", href):
-                links.append(urljoin(url, href))
+            # Only consider links that appear to have a file extension
+            if not re.search(r"\.[a-zA-Z0-9]+$", href):
+                continue
+
+            ext = os.path.splitext(href)[1].lower()
+
+            # If user requested skipping media, filter out common audio/video types
+            if SKIP_MEDIA and ext in MEDIA_EXTENSIONS:
+                continue
+
+            links.append(urljoin(url, href))
         return links
 
     # Prefer httpx (HTTP/2) first when enabled
@@ -2061,6 +2080,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-proxy", action="store_true", help="Ignore system proxy settings for HTTP requests")
     parser.add_argument("--use-httpx", action="store_true", help="Use httpx (HTTP/2) fallback before Playwright")
     parser.add_argument("--no-httpx", action="store_true", help="Disable httpx fallback (HTTP/2) for page fetches")
+    parser.add_argument("--skip-media", action="store_true", help="Skip audio and video files when scraping links")
     args = parser.parse_args()
 
     # Apply CLI args to module-level globals
@@ -2182,6 +2202,9 @@ if __name__ == "__main__":
     DEFAULT_SCRAPE_MAX_RETRIES = args.max_retries
     DEBUG_HTTP = args.debug_http
     session.trust_env = USE_SYSTEM_PROXY
+    # Skip media flag: when True, the scraper will ignore common audio/video files
+    if args.skip_media:
+        SKIP_MEDIA = True
 
     if args.no_playwright:
         DEFAULT_USE_PLAYWRIGHT = False
